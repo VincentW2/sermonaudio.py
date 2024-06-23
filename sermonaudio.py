@@ -1,11 +1,11 @@
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
-import sys
+import argparse
 
-def search_sermonaudio(query):
+def search_sermonaudio(query, page):
     base_url = 'https://www.sermonaudio.com'
-    search_url = f'{base_url}/sermons.asp?keyword={query}'
+    search_url = f'{base_url}/sermons.asp?currpage={page}&keyword={query}'
     
     try:
         response = requests.get(search_url)
@@ -32,12 +32,15 @@ def search_sermonaudio(query):
     return search_results
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python scriptname.py (query)")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Search SermonAudio and retrieve sermon links.")
+    parser.add_argument('query', type=str, help='The search query.')
+    parser.add_argument('--page', type=int, default=1, help='The page number of search results (default is 1).')
     
-    query = sys.argv[1]
-    results = search_sermonaudio(query)
+    args = parser.parse_args()
+    query = args.query
+    page = args.page
+    
+    results = search_sermonaudio(query, page)
 
     for result in results:
         print(f"Title: {result['title']}")
