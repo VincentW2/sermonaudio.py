@@ -3,6 +3,8 @@ from bs4 import BeautifulSoup
 import os
 import urllib.parse
 import re
+from tqdm import tqdm
+
 
 def sanitize_filename(filename):
     # Remove or replace characters that are invalid in filenames
@@ -94,17 +96,26 @@ def download_sermon(url, output_directory):
             filename = sanitize_filename(sermon_data['title'])
             filepath = os.path.join(output_directory, filename)
             
-            with open(filepath, 'wb') as f:
-                for chunk in mp3_response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
+            with open(filepath, 'wb') as f, tqdm(
+                desc=filename,
+                total=content_length,
+                unit='iB',
+                unit_scale=True,
+                unit_divisor=1024,
+            ) as progress_bar:
+                for data in mp3_response.iter_content(chunk_size=8192):
+                    size = f.write(data)
+                    progress_bar.update(size)
             print(f"Downloaded: {filename}")
+            return True
         except requests.exceptions.RequestException as e:
             print(f"Error during download: {e}")
         except IOError as e:
             print(f"Error writing file: {e}")
     else:
         print("MP3 URL not found in sermon data")
+    return False
+
 
 # Example usage
 url = "beta.sermonaudio.com/sermons/714242349564949/"

@@ -5,6 +5,7 @@ import urllib.parse
 import re
 import time
 
+
 def sanitize_filename(filename):
     filename = re.sub(r'[<>:"/\\|?*]', '', filename)
     filename = filename.strip()
