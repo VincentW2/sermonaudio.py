@@ -1,4 +1,4 @@
 mutagen
 requests
 beautifulsoup4
-flet
+PySide6

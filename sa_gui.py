@@ -1,678 +1,1444 @@
-import flet as ft
-import threading
-import sys
+#!/usr/bin/env python3
+"""
+Qt GUI for SermonAudio tools.
+
+Tabs:
+1. Search
+2. Manual Download
+3. Queue
+"""
+
+from __future__ import annotations
+
 import io
 import os
-import ctypes
-import ctypes.util
-from pathlib import Path
-import sa_search
-import sa_dl
-import sa_speaker
-import sa_broadcaster
+import subprocess
+import sys
+import traceback
+import webbrowser
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
+
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QTextCursor
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QFrame,
+    QGraphicsDropShadowEffect,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QProgressBar,
+    QScrollArea,
+    QSizePolicy,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
+
 import sa_auth
+import sa_broadcaster
 import sa_config
+import sa_dl
+import sa_search
+import sa_series
+import sa_speaker
 
-# Redirect stdout to capture print statements for the GUI log
-class TextRedirector(io.StringIO):
-    def __init__(self, text_widget):
+
+def _safe_text(value: Optional[str], fallback: str = "") -> str:
+    text = value or fallback
+    return str(text).strip()
+
+
+def _sermon_title(item: dict) -> str:
+    return _safe_text(item.get("fullTitle")) or _safe_text(item.get("displayTitle"), "Untitled Sermon")
+
+
+def _speaker_name(item: dict) -> str:
+    return _safe_text(item.get("speaker", {}).get("displayName"), "Unknown speaker")
+
+
+def _broadcaster_name(item: dict) -> str:
+    return _safe_text(item.get("broadcaster", {}).get("displayName"), "Unknown broadcaster")
+
+
+class WorkerSignals(QObject):
+    started = Signal()
+    status = Signal(str)
+    progress = Signal(int, int)
+    finished = Signal(object)
+    error = Signal(str)
+    done = Signal()
+
+
+class Worker(QRunnable):
+    def __init__(self, fn: Callable[[WorkerSignals], Any]):
         super().__init__()
-        self.text_widget = text_widget
+        self.fn = fn
+        self.signals = WorkerSignals()
 
-    def write(self, string):
-        # Schedule the update on the main thread
-        self.text_widget.value += string
-        self.text_widget.update()
-        # Also print to real stdout for debugging
-        sys.__stdout__.write(string)
+    def _emit(self, signal: Signal, *args):
+        try:
+            signal.emit(*args)
+        except RuntimeError:
+            # Receiver/source can be destroyed during app shutdown.
+            pass
 
-
-LIB_STAGING_DIR = Path(__file__).resolve().parent / ".native_libs"
-
-
-def _safe_unlink(path: Path):
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
-
-
-def configure_linux_ui_defaults():
-    if sys.platform != "linux":
-        return
-    # Force a known-good cursor theme when none is configured to avoid GTK warnings.
-    os.environ.setdefault("XCURSOR_THEME", "Adwaita")
-
-
-def _libmpv_available(target: str) -> bool:
-    try:
-        ctypes.CDLL(target)
-        return True
-    except OSError:
-        return False
-
-
-def ensure_libmpv():
-    """
-    Flet's media widgets require libmpv.so.1 on Linux. Some distributions (Arch, Fedora, etc.)
-    only ship libmpv.so.2+, so we create a local symlink that satisfies the loader without
-    requiring sudo hacks.
-    """
-    if sys.platform != "linux":
-        return
-
-    lib_name = "libmpv.so.1"
-    if _libmpv_available(lib_name):
-        return
-
-    env_ld_paths = [p for p in os.environ.get("LD_LIBRARY_PATH", "").split(":") if p]
-    common_dirs = [
-        "/usr/lib",
-        "/usr/lib64",
-        "/usr/lib/x86_64-linux-gnu",
-        "/lib",
-        "/lib64",
-        "/lib/x86_64-linux-gnu",
-    ]
-    search_dirs = []
-    for path in env_ld_paths + common_dirs:
-        if path and os.path.isdir(path) and path not in search_dirs:
-            search_dirs.append(path)
-
-    candidate_path = None
-    versioned_matches = []
-    for directory in search_dirs:
-        dir_path = Path(directory)
-        for match in sorted(dir_path.glob("libmpv.so*"), key=lambda p: p.name, reverse=True):
-            if not match.exists():
-                continue
-            if match.name == lib_name:
-                candidate_path = match.resolve()
-                break
-            if match.name.startswith("libmpv.so.") and match.name != "libmpv.so":
-                versioned_matches.append(match.resolve())
-        if candidate_path:
-            break
-
-    if not candidate_path and versioned_matches:
-        candidate_path = versioned_matches[0]
-
-    if not candidate_path:
-        located = ctypes.util.find_library("mpv")
-        if located and os.path.isabs(located):
-            candidate_path = Path(located).resolve()
-
-    if not candidate_path:
-        print("[Init] Warning: libmpv not found on system paths; media playback may fail.")
-        return
-
-    LIB_STAGING_DIR.mkdir(exist_ok=True)
-    link_path = LIB_STAGING_DIR / lib_name
-
-    try:
-        if link_path.exists() or link_path.is_symlink():
-            current_target = None
-            try:
-                current_target = link_path.resolve()
-            except OSError:
-                pass
-            if current_target != candidate_path:
-                _safe_unlink(link_path)
-                os.symlink(str(candidate_path), link_path)
+    def run(self):
+        self._emit(self.signals.started)
+        try:
+            result = self.fn(self.signals)
+        except Exception as exc:
+            self._emit(self.signals.error, f"{exc}\n{traceback.format_exc()}")
         else:
-            os.symlink(str(candidate_path), link_path)
-    except OSError as err:
-        print(f"[Init] Unable to prepare libmpv shim: {err}")
-        return
-
-    existing_ld = [p for p in os.environ.get("LD_LIBRARY_PATH", "").split(":") if p]
-    if str(LIB_STAGING_DIR) not in existing_ld:
-        os.environ["LD_LIBRARY_PATH"] = ":".join([str(LIB_STAGING_DIR)] + existing_ld).strip(":")
-
-    if _libmpv_available(str(link_path)):
-        print(f"[Init] libmpv resolved via {link_path} -> {candidate_path}")
-    else:
-        print("[Init] Warning: libmpv shim could not be loaded; playback may still fail.")
+            self._emit(self.signals.finished, result)
+        finally:
+            self._emit(self.signals.done)
 
 
-ensure_libmpv()
-configure_linux_ui_defaults()
+class GuiLogStream(QObject):
+    text_emitted = Signal(str)
 
-def main(page: ft.Page):
-    # Load Config
-    app_config = sa_config.load_config()
-    
-    page.title = "SermonAudio Downloader"
-    page.theme_mode = ft.ThemeMode.DARK if app_config.get("theme_mode") == "dark" else ft.ThemeMode.LIGHT
-    page.padding = 20
-    page.window_width = 1000
-    page.window_height = 800
-    
-    # Global state
-    download_dir = app_config.get("download_dir", os.getcwd())
-    download_queue = [] # List of task objects
-    
-    # --- Components ---
-    
-    # Header
-    header = ft.Text("SermonAudio Downloader", size=30, weight="bold")
-    
-    # Auth Status
-    auth_status = ft.Text("Checking API Key...", color="orange", size=12)
-    
-    def check_auth():
+    def __init__(self, original):
+        super().__init__()
+        self.original = original
+
+    def write(self, s):
+        if not s:
+            return 0
+        self.text_emitted.emit(str(s))
         try:
-            key = sa_auth.get_api_key()
-            auth_status.value = f"API Key Active: ...{key[-6:]}"
-            auth_status.color = "green"
-        except Exception as e:
-            auth_status.value = f"Auth Error: {e}"
-            auth_status.color = "red"
-        page.update()
+            self.original.write(str(s))
+            self.original.flush()
+        except Exception:
+            pass
+        return len(s)
 
-    # Log Area
-    log_output = ft.Text(value="", size=12, font_family="Consolas", selectable=True)
-    log_container = ft.Column(
-        [log_output], 
-        scroll=ft.ScrollMode.AUTO, 
-        height=150,
-        width=float("inf")
-    )
-    log_card = ft.Container(
-        content=log_container,
-        border=ft.border.all(1, "outline"),
-        border_radius=5,
-        padding=10,
-        bgcolor="surfaceVariant"
-    )
-    
-    logs_visible = app_config.get("show_logs", True)
-    
-    def toggle_logs(e):
-        nonlocal logs_visible
-        logs_visible = not logs_visible
-        log_card.visible = logs_visible
-        btn_toggle_logs.text = "Hide Logs" if logs_visible else "Show Logs"
-        sa_config.save_config("show_logs", logs_visible)
-        page.update()
-
-    btn_toggle_logs = ft.TextButton("Hide Logs" if logs_visible else "Show Logs", on_click=toggle_logs)
-    log_card.visible = logs_visible
-
-    # Redirect print
-    sys.stdout = TextRedirector(log_output)
-
-    # --- Download Queue UI ---
-    queue_list = ft.ListView(expand=True, spacing=5, padding=10)
-    
-    def open_file(path):
+    def flush(self):
         try:
-            if sys.platform == "win32":
-                os.startfile(path)
-            elif sys.platform == "darwin":
-                import subprocess
-                subprocess.call(('open', path))
-            else:
-                import subprocess
-                subprocess.call(('xdg-open', path))
-        except Exception as e:
-            print(f"[GUI] Error opening file: {e}")
+            self.original.flush()
+        except Exception:
+            pass
 
-    def add_to_queue(name, status="Pending"):
-        # Creates a UI row for the download
-        pb = ft.ProgressBar(width=200, value=0)
-        status_text = ft.Text(status, size=12, width=100)
-        play_btn = ft.IconButton(
-            icon=ft.Icons.PLAY_ARROW, 
-            visible=False,
-            tooltip="Play File"
+
+@dataclass
+class QueueTaskUI:
+    task_id: int
+    name_item: QTableWidgetItem
+    type_item: QTableWidgetItem
+    status_item: QTableWidgetItem
+    progress_bar: QProgressBar
+    action_btn: QPushButton
+    open_path: Optional[str] = None
+    done: bool = False
+
+
+class CollapsibleSection(QFrame):
+    def __init__(self, title: str, start_collapsed: bool = False):
+        super().__init__()
+        self.setObjectName("CollapsibleSection")
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(3)
+
+        self.toggle_btn = QToolButton()
+        self.toggle_btn.setObjectName("CollapseToggle")
+        self.toggle_btn.setText(title)
+        self.toggle_btn.setCheckable(True)
+        self.toggle_btn.setChecked(not start_collapsed)
+        self.toggle_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.toggle_btn.setArrowType(
+            Qt.ArrowType.DownArrow if not start_collapsed else Qt.ArrowType.RightArrow
         )
-        
-        row = ft.Row([
-            ft.Icon(ft.Icons.DOWNLOAD),
-            ft.Text(name, expand=True, no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
-            status_text,
-            pb,
-            play_btn
-        ])
-        queue_list.controls.append(row)
-        page.update()
-        return pb, status_text, play_btn
+        self.toggle_btn.clicked.connect(self._on_toggled)
 
-    # --- Search Tab ---
-    search_query = ft.TextField(label="Search Query", expand=True)
-    search_results = ft.ListView(expand=True, spacing=10, padding=10)
+        self.body = QWidget()
+        self.body.setVisible(not start_collapsed)
+        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout.setContentsMargins(0, 0, 0, 0)
+        self.body_layout.setSpacing(6)
 
-    def run_search(e):
-        query = search_query.value
-        if not query:
-            return
-        
-        search_results.controls.clear()
-        search_results.controls.append(ft.Text("Searching...", italic=True))
-        page.update()
+        outer.addWidget(self.toggle_btn)
+        outer.addWidget(self.body)
 
-        def _search_task():
-            try:
-                data = sa_search.perform_search(query)
-                def update_ui():
-                    search_results.controls.clear()
-                    
-                    # Sermons
-                    if data.get('sermonResults'):
-                        search_results.controls.append(ft.Text("Top Sermons", weight="bold", size=16))
-                        for s in data['sermonResults'][:5]:
-                            sid = s.get('sermonID')
-                            title = s.get('fullTitle', 'Untitled')
-                            speaker = s.get('speaker', {}).get('displayName', 'Unknown')
-                            
-                            search_results.controls.append(
-                                ft.Row([
-                                    ft.Column([
-                                        ft.Text(title, weight="bold"),
-                                        ft.Text(f"{speaker} (ID: {sid})", size=12, color="grey")
-                                    ], expand=True),
-                                    ft.IconButton(
-                                        icon=ft.Icons.DOWNLOAD, 
-                                        tooltip="Download Audio",
-                                        on_click=lambda _, s=sid, t=title: start_download_single(s, title=t)
-                                    )
-                                ])
-                            )
-                            search_results.controls.append(ft.Divider())
+    def _on_toggled(self, checked: bool):
+        self.body.setVisible(bool(checked))
+        self.toggle_btn.setArrowType(
+            Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow
+        )
 
-                    # Broadcasters
-                    if data.get('broadcasterResults'):
-                        search_results.controls.append(ft.Text("Broadcasters", weight="bold", size=16))
-                        for b in data['broadcasterResults'][:3]:
-                            bid = b.get('broadcasterID')
-                            name = b.get('displayName')
-                            search_results.controls.append(
-                                ft.Row([
-                                    ft.Text(f"{name} ({bid})", expand=True),
-                                    ft.ElevatedButton("Download All", on_click=lambda _, b=bid, n=name: start_download_broadcaster(b, n))
-                                ])
-                            )
-                            search_results.controls.append(ft.Divider())
-
-                    # Speakers
-                    if data.get('speakerResults'):
-                        search_results.controls.append(ft.Text("Speakers", weight="bold", size=16))
-                        for sp in data['speakerResults'][:3]:
-                            spid = str(sp.get('speakerID'))
-                            name = sp.get('displayName')
-                            search_results.controls.append(
-                                ft.Row([
-                                    ft.Text(f"{name} ({spid})", expand=True),
-                                    ft.ElevatedButton("Download All", on_click=lambda _, s=spid, n=name: start_download_speaker(s, n))
-                                ])
-                            )
-                            search_results.controls.append(ft.Divider())
-                    
-                    page.update()
-
-                update_ui()
-
-            except Exception as e:
-                def show_error():
-                    search_results.controls.append(ft.Text(f"Error: {e}", color="red"))
-                    page.update()
-                show_error()
-            
-        threading.Thread(target=_search_task, daemon=True).start()
-
-    search_query.on_submit = run_search
-
-    # --- Download Logic ---
-    
-    dl_target = ft.TextField(label="URL or ID", expand=True)
-    
-    dl_format = ft.Dropdown(
-        options=[ft.dropdown.Option("Audio"), ft.dropdown.Option("Video")],
-        value="Audio",
-        width=150,
-        label="Format"
-    )
-    
-    # Updated to include more video options if needed, logic handles mapping
-    dl_quality = ft.Dropdown(
-        options=[
-            ft.dropdown.Option("Low"), 
-            ft.dropdown.Option("High")
-        ],
-        value="Low",
-        width=150,
-        label="Quality"
-    )
-
-    def on_format_change(e):
-        fmt = dl_format.value
-        if fmt == "Audio":
-            dl_quality.options = [
-                ft.dropdown.Option("Low"), 
-                ft.dropdown.Option("High")
-            ]
-            # Reset if current selection is invalid for Audio
-            if dl_quality.value == "1080p":
-                dl_quality.value = "Low"
-        else:
-            dl_quality.options = [
-                ft.dropdown.Option("Low"), 
-                ft.dropdown.Option("High"),
-                ft.dropdown.Option("1080p")
-            ]
-        page.update()
-
-    dl_format.on_change = on_format_change
-
-    def start_download_single(target, title=None):
-        # Switch to queue tab
-        tabs.selected_index = 2
-        page.update()
-        
-        display_name = title or target
-        pb, status_lbl, play_btn = add_to_queue(f"{display_name} ({dl_format.value})")
-        
-        fmt = dl_format.value.lower()
-        qual = dl_quality.value.lower()
-
-        def _task():
-            status_lbl.value = "Starting..."
-            page.update()
-            
-            final_path = None
-
-            try:
-                sid = sa_dl.extract_sermon_id(target)
-                
-                # Video Availability Check
-                if fmt == "video" and sid:
-                    status_lbl.value = "Checking Info..."
-                    page.update()
-                    info = sa_search.get_sermon_info(sid)
-                    if not info:
-                        status_lbl.value = "Info Error"
-                        status_lbl.color = "red"
-                        page.update()
-                        return
-                    
-                    has_video = info.get('hasVideo', False)
-                    media_vid = info.get('media', {}).get('video', [])
-                    if not has_video or not media_vid:
-                        status_lbl.value = "No Video"
-                        status_lbl.color = "red"
-                        page.update()
-                        return
-
-                status_lbl.value = "Downloading..."
-                page.update()
-
-                def progress_hook(current, total):
-                    if total > 0:
-                        pb.value = current / total
-                        status_lbl.value = f"{int((current/total)*100)}%"
-                    page.update()
-
-                # Download Logic
-                if fmt == "video":
-                    sid = sid or target 
-                    url = sa_dl.build_video_url(sid, qual)
-                    final_path = sa_dl.download_file(url, download_dir, media_type="video", quality=qual, progress_callback=progress_hook)
-                else:
-                    if sid:
-                        final_path = sa_dl.download_audio_with_fallback(sid, download_dir, preferred_quality=qual, progress_callback=progress_hook)
-                    else:
-                        final_path = sa_dl.download_file(target, download_dir, media_type="audio", quality=qual, progress_callback=progress_hook)
-                
-                status_lbl.value = "Complete"
-                status_lbl.color = "green"
-                pb.value = 1
-                
-                if final_path and os.path.exists(final_path):
-                    play_btn.visible = True
-                    play_btn.on_click = lambda _: open_file(str(final_path))
-                
-                page.update()
-                        
-            except Exception as e:
-                print(f"[GUI] Error: {e}")
-                status_lbl.value = "Error"
-                status_lbl.color = "red"
-                page.update()
-        
-        threading.Thread(target=_task, daemon=True).start()
-
-    def start_download_speaker(sid, name=None):
-        tabs.selected_index = 2
-        page.update()
-        
-        name = name or sid
-        pb, status_lbl, play_btn = add_to_queue(f"Speaker: {name}")
-        status_lbl.value = "Fetching list..."
-        pb.type = ft.ProgressBarOperation.INDETERMINATE
-        page.update()
-
-        def _task():
-            try:
-                speaker_name = sa_speaker.get_speaker_name(sid)
-                ids = sa_speaker.collect_sermon_ids_via_node(sid, page_size=50, max_pages=2) # limit for demo
-                
-                status_lbl.value = f"Found {len(ids)}"
-                pb.type = ft.ProgressBarOperation.DETERMINATE
-                pb.value = 0
-                page.update()
-                
-                for idx, s in enumerate(ids):
-                    status_lbl.value = f"{idx+1}/{len(ids)}"
-                    pb.value = (idx) / len(ids)
-                    page.update()
-                    
-                    # We don't have individual progress bars for bulk yet, just overall
-                    sa_speaker.download_sermon_audio(s, download_dir, speaker_name)
-                
-                status_lbl.value = "Complete"
-                status_lbl.color = "green"
-                pb.value = 1
-                
-                # Open folder button for bulk?
-                play_btn.icon = ft.Icons.FOLDER
-                play_btn.tooltip = "Open Folder"
-                play_btn.visible = True
-                # Construct expected path (heuristic)
-                folder_path = os.path.join(download_dir, sa_dl.sanitize_filename(speaker_name))
-                play_btn.on_click = lambda _: open_file(folder_path)
-                
-                page.update()
-
-            except Exception as e:
-                print(f"[GUI] Error: {e}")
-                status_lbl.value = "Error"
-                status_lbl.color = "red"
-        
-        threading.Thread(target=_task, daemon=True).start()
-
-    def start_download_broadcaster(bid, name=None):
-        tabs.selected_index = 2
-        page.update()
-        
-        name = name or bid
-        pb, status_lbl, play_btn = add_to_queue(f"Broadcaster: {name}")
-        status_lbl.value = "Fetching list..."
-        pb.type = ft.ProgressBarOperation.INDETERMINATE
-        page.update()
-
-        def _task():
-            try:
-                bname = sa_broadcaster.get_broadcaster_name(bid)
-                ids = sa_broadcaster.collect_sermon_ids_via_broadcaster(bid, page_size=50, max_pages=2)
-                
-                status_lbl.value = f"Found {len(ids)}"
-                pb.type = ft.ProgressBarOperation.DETERMINATE
-                pb.value = 0
-                page.update()
-
-                for idx, s in enumerate(ids):
-                    status_lbl.value = f"{idx+1}/{len(ids)}"
-                    pb.value = (idx) / len(ids)
-                    page.update()
-                    sa_broadcaster.download_sermon_audio(s, download_dir, bname)
-                
-                status_lbl.value = "Complete"
-                status_lbl.color = "green"
-                pb.value = 1
-                
-                # Open folder button for bulk
-                play_btn.icon = ft.Icons.FOLDER
-                play_btn.tooltip = "Open Folder"
-                play_btn.visible = True
-                folder_path = os.path.join(download_dir, sa_dl.sanitize_filename(bname))
-                play_btn.on_click = lambda _: open_file(folder_path)
-                
-                page.update()
-            except Exception as e:
-                print(f"[GUI] Error: {e}")
-                status_lbl.value = "Error"
-                status_lbl.color = "red"
-        
-        threading.Thread(target=_task, daemon=True).start()
+    def clear_content(self):
+        while self.body_layout.count():
+            item = self.body_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
 
 
-    # Layout
-    tabs = ft.Tabs(
-        selected_index=0,
-        animation_duration=300,
-        tabs=[
-            ft.Tab(
-                text="Search",
-                icon=ft.Icons.SEARCH,
-                content=ft.Column([
-                    ft.Container(height=10),
-                    ft.Row([search_query, ft.IconButton(ft.Icons.ARROW_FORWARD, on_click=run_search)]),
-                    search_results
-                ])
-            ),
-            ft.Tab(
-                text="Manual Download",
-                icon=ft.Icons.DOWNLOAD,
-                content=ft.Column([
-                    ft.Container(height=20),
-                    ft.Row([
-                        dl_target, 
-                        ft.Container(width=10), 
-                        dl_format, 
-                        ft.Container(width=10),
-                        dl_quality,
-                        ft.Container(width=10),
-                        ft.ElevatedButton("Download", on_click=lambda _: start_download_single(dl_target.value), height=50)
-                    ], alignment=ft.MainAxisAlignment.CENTER),
-                    ft.Text("Enter a Sermon ID or URL above.", color="grey", italic=True)
-                ])
-            ),
-            ft.Tab(
-                text="Queue",
-                icon=ft.Icons.LIST,
-                content=queue_list
+class SermonAudioMainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("SermonAudio Downloader")
+        self.resize(1200, 860)
+        self.setFont(QFont("Segoe UI", 9))
+
+        self.config = sa_config.load_config()
+        self.download_dir = self.config.get("download_dir", os.getcwd())
+        self.show_logs = bool(self.config.get("show_logs", True))
+        self.dark_mode = self.config.get("theme_mode", "dark") == "dark"
+
+        self.thread_pool = QThreadPool.globalInstance()
+        self.queue_tasks: dict[int, QueueTaskUI] = {}
+        self.next_task_id = 1
+        self.active_tasks = 0
+
+        self._orig_stdout = sys.stdout
+        self._orig_stderr = sys.stderr
+        self.log_stream = GuiLogStream(sys.__stdout__)
+        self.log_stream.text_emitted.connect(self._append_log_text)
+        sys.stdout = self.log_stream
+        sys.stderr = self.log_stream
+
+        self._build_ui()
+        self._apply_theme(self.dark_mode)
+        self._update_log_visibility(self.show_logs, save=False)
+        self._refresh_queue_counts()
+        self._refresh_auth_status(force=False)
+
+    def _build_ui(self):
+        central = QWidget()
+        central.setObjectName("AppRoot")
+        root = QVBoxLayout(central)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        header = self._build_header()
+        self._apply_shadow(header, blur=36, y_offset=6, alpha=90)
+        root.addWidget(header)
+
+        folder = self._build_folder_bar()
+        self._apply_shadow(folder, blur=22, y_offset=4, alpha=70)
+        root.addWidget(folder)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_search_tab(), "Search")
+        self.tabs.addTab(self._build_manual_tab(), "Manual Download")
+        self.tabs.addTab(self._build_queue_tab(), "Queue")
+        tabs_shell = QFrame()
+        tabs_shell.setObjectName("TabsShell")
+        tabs_layout = QVBoxLayout(tabs_shell)
+        tabs_layout.setContentsMargins(10, 10, 10, 10)
+        tabs_layout.addWidget(self.tabs)
+        self._apply_shadow(tabs_shell, blur=26, y_offset=5, alpha=75)
+        root.addWidget(tabs_shell, 1)
+
+        log_shell = self._build_log_panel()
+        log_shell.setObjectName("LogShell")
+        self._apply_shadow(log_shell, blur=18, y_offset=4, alpha=65)
+        root.addWidget(log_shell)
+
+        self.setCentralWidget(central)
+
+    def _apply_shadow(self, widget: QWidget, blur: int, y_offset: int, alpha: int):
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(blur)
+        shadow.setOffset(0, y_offset)
+        shadow.setColor(QColor(0, 0, 0, alpha))
+        widget.setGraphicsEffect(shadow)
+
+    def _build_header(self) -> QWidget:
+        frame = QFrame()
+        frame.setObjectName("HeaderFrame")
+        layout = QHBoxLayout(frame)
+        layout.setContentsMargins(18, 16, 18, 16)
+
+        left = QVBoxLayout()
+        title = QLabel("SermonAudio Downloader")
+        title.setObjectName("HeaderTitle")
+        subtitle = QLabel("Qt desktop app with live search, queue workers, and progress tracking.")
+        subtitle.setObjectName("HeaderSubtitle")
+        left.addWidget(title)
+        left.addWidget(subtitle)
+        layout.addLayout(left, 1)
+
+        right = QHBoxLayout()
+        self.auth_label = QLabel("Checking API key...")
+        self.auth_label.setObjectName("AuthLabel")
+        self.settings_btn = QToolButton()
+        self.settings_btn.setText("Settings")
+        self.settings_btn.clicked.connect(self._open_settings_dialog)
+        right.addWidget(self.auth_label)
+        right.addWidget(self.settings_btn)
+        layout.addLayout(right)
+
+        return frame
+
+    def _build_folder_bar(self) -> QWidget:
+        frame = QFrame()
+        frame.setObjectName("FolderBar")
+        layout = QHBoxLayout(frame)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(8)
+
+        layout.addWidget(QLabel("Download folder:"))
+        self.download_dir_label = QLabel(self.download_dir)
+        self.download_dir_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.download_dir_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.download_dir_label, 1)
+
+        change_btn = QPushButton("Change")
+        change_btn.clicked.connect(self._choose_download_dir)
+        open_btn = QPushButton("Open")
+        open_btn.clicked.connect(lambda: self._open_path(self.download_dir))
+        layout.addWidget(change_btn)
+        layout.addWidget(open_btn)
+        return frame
+
+    def _build_search_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(2, 2, 2, 2)
+        top.setSpacing(10)
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search sermons, speakers, broadcasters...")
+        self.search_input.returnPressed.connect(self._run_search)
+        self.search_newest_check = QCheckBox("Newest")
+        self.search_btn = QPushButton("Search")
+        self.search_btn.clicked.connect(self._run_search)
+        top.addWidget(self.search_input, 1)
+        top.addWidget(self.search_newest_check)
+        top.addWidget(self.search_btn)
+        layout.addLayout(top)
+
+        self.search_status = QLabel("")
+        self.search_status.setObjectName("SearchStatus")
+        layout.addWidget(self.search_status)
+
+        self.search_scroll = QScrollArea()
+        self.search_scroll.setObjectName("SearchScroll")
+        self.search_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.search_scroll.setWidgetResizable(True)
+        self.search_scroll.viewport().setObjectName("SearchViewport")
+
+        self.search_results_host = QWidget()
+        self.search_results_host.setObjectName("SearchResultsHost")
+        self.search_results_layout = QVBoxLayout(self.search_results_host)
+        self.search_results_layout.setContentsMargins(6, 6, 6, 6)
+        self.search_results_layout.setSpacing(8)
+
+        self.speakers_section = CollapsibleSection("Speakers", start_collapsed=True)
+        self.sermons_section = CollapsibleSection("Sermons", start_collapsed=True)
+        self.series_section = CollapsibleSection("Serieses", start_collapsed=True)
+        self.broadcasters_section = CollapsibleSection("Broadcasters", start_collapsed=True)
+
+        self.search_results_layout.addWidget(self.speakers_section)
+        self.search_results_layout.addWidget(self.sermons_section)
+        self.search_results_layout.addWidget(self.series_section)
+        self.search_results_layout.addWidget(self.broadcasters_section)
+        self.search_results_layout.addStretch(1)
+
+        self.search_scroll.setWidget(self.search_results_host)
+        layout.addWidget(self.search_scroll, 1)
+
+        return tab
+
+    def _build_manual_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(12)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(10)
+        self.manual_target_input = QLineEdit()
+        self.manual_target_input.setPlaceholderText("Sermon URL or ID")
+        self.manual_target_input.returnPressed.connect(self._queue_manual_download)
+
+        self.manual_format_combo = QComboBox()
+        self.manual_format_combo.addItems(["Audio", "Video"])
+        self.manual_format_combo.currentTextChanged.connect(self._on_manual_format_changed)
+
+        self.manual_quality_combo = QComboBox()
+        self.manual_quality_combo.addItems(["Low", "High"])
+
+        queue_btn = QPushButton("Queue Download")
+        queue_btn.clicked.connect(self._queue_manual_download)
+
+        row.addWidget(self.manual_target_input, 1)
+        row.addWidget(self.manual_format_combo)
+        row.addWidget(self.manual_quality_combo)
+        row.addWidget(queue_btn)
+        layout.addLayout(row)
+
+        help_lbl = QLabel("Use a sermon page URL, direct media URL, or numeric sermon ID.")
+        help_lbl.setObjectName("MutedText")
+        layout.addWidget(help_lbl)
+        layout.addStretch(1)
+        return tab
+
+    def _build_queue_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(10)
+        queue_lbl = QLabel("Queue")
+        queue_lbl.setObjectName("PanelLabel")
+        top.addWidget(queue_lbl)
+        self.queued_count_label = QLabel("0 queued")
+        self.active_count_label = QLabel("0 active")
+        top.addWidget(self.queued_count_label)
+        top.addWidget(self.active_count_label)
+        top.addStretch(1)
+        clear_done_btn = QPushButton("Clear Completed")
+        clear_done_btn.clicked.connect(self._clear_completed_tasks)
+        clear_all_btn = QPushButton("Clear All")
+        clear_all_btn.clicked.connect(self._clear_all_tasks)
+        top.addWidget(clear_done_btn)
+        top.addWidget(clear_all_btn)
+        layout.addLayout(top)
+
+        self.queue_table = QTableWidget(0, 5)
+        self.queue_table.setHorizontalHeaderLabels(["Item", "Type", "Status", "Progress", "Action"])
+        self.queue_table.verticalHeader().setVisible(False)
+        self.queue_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.queue_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.queue_table.setAlternatingRowColors(True)
+        self.queue_table.setShowGrid(False)
+        self.queue_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.queue_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.queue_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.queue_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.queue_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self.queue_table, 1)
+        return tab
+
+    def _build_log_panel(self) -> QWidget:
+        frame = QFrame()
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(10, 8, 10, 10)
+        layout.setSpacing(6)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(8, 4, 8, 6)
+        row.setSpacing(10)
+        logs_lbl = QLabel("Logs")
+        logs_lbl.setObjectName("PanelLabel")
+        row.addWidget(logs_lbl)
+        row.addStretch(1)
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(lambda: self.log_text.clear())
+        self.toggle_logs_btn = QPushButton("Hide Logs")
+        self.toggle_logs_btn.clicked.connect(self._toggle_logs_visibility)
+        row.addWidget(clear_btn)
+        row.addWidget(self.toggle_logs_btn)
+        layout.addLayout(row)
+
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setObjectName("LogText")
+        self.log_text.setFrameShape(QFrame.Shape.NoFrame)
+        self.log_text.viewport().setObjectName("LogViewport")
+        self.log_text.setMinimumHeight(140)
+        layout.addWidget(self.log_text)
+        return frame
+    def _apply_theme(self, dark: bool):
+        if dark:
+            self.setStyleSheet(
+                """
+                QMainWindow { background: #081018; color: #e7edf3; }
+                QWidget#AppRoot { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #091522, stop:0.55 #0c1724, stop:1 #10131f); }
+                QLabel { color: #deebf4; background: transparent; }
+                QFrame#HeaderFrame {
+                    background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #0d6e86, stop:0.55 #0d8da2, stop:1 #117f94);
+                    border: 1px solid #2ca4b7;
+                    border-radius: 16px;
+                }
+                QLabel#HeaderTitle { color: #ffffff; font-size: 30px; font-weight: 800; letter-spacing: 0.25px; }
+                QLabel#HeaderSubtitle { color: #d9f5fa; font-size: 13px; }
+                QLabel#AuthLabel { color: #c0ffd0; font-weight: 700; }
+                QLabel#PanelLabel { color: #dff0fb; font-size: 22px; font-weight: 700; }
+
+                QFrame#FolderBar, QFrame#TabsShell, QFrame#LogShell {
+                    border: 1px solid #263748;
+                    border-radius: 12px;
+                    background: #101a25;
+                }
+
+                QLabel#SearchStatus, QLabel#MutedText { color: #94aeca; }
+                QFrame#ResultCard {
+                    border: 1px solid #2a3f54;
+                    border-radius: 12px;
+                    background: #131f2d;
+                }
+                QLabel#ResultTitle { color: #eaf6ff; font-size: 12px; font-weight: 700; }
+                QLabel#ResultMeta { color: #9eb8cc; font-size: 10px; }
+                QFrame#CollapsibleSection {
+                    border: 1px solid #2a3f54;
+                    border-radius: 8px;
+                    background: #111c29;
+                    padding: 2px;
+                }
+                QToolButton#CollapseToggle {
+                    text-align: left;
+                    border: 1px solid #2e4459;
+                    border-radius: 8px;
+                    background: #162737;
+                    color: #b9d3e7;
+                    font-weight: 600;
+                    padding: 5px 10px;
+                }
+                QToolButton#CollapseToggle:hover {
+                    background: #1f3348;
+                    border-color: #4e7494;
+                }
+                QToolButton#CollapseToggle:checked {
+                    background: #20506d;
+                    color: #f3fbff;
+                    border-color: #3f6b89;
+                }
+
+                QLineEdit, QComboBox, QTableWidget {
+                    background: #0f1a26;
+                    border: 1px solid #2d4256;
+                    border-radius: 7px;
+                    padding: 5px;
+                    color: #e5f2ff;
+                    selection-background-color: #2f94ae;
+                }
+                QLineEdit::placeholder {
+                    color: #7f9fb8;
+                }
+                QComboBox QAbstractItemView {
+                    background: #0f1a26;
+                    color: #e5f2ff;
+                    border: 1px solid #2d4256;
+                    selection-background-color: #2f94ae;
+                    selection-color: #f5fcff;
+                }
+                QCheckBox {
+                    color: #dcebf7;
+                    spacing: 8px;
+                    padding-right: 2px;
+                }
+                QCheckBox::indicator {
+                    width: 16px;
+                    height: 16px;
+                    border: 1px solid #4f6f89;
+                    border-radius: 4px;
+                    background: #0f1a26;
+                }
+                QCheckBox::indicator:hover {
+                    border-color: #6f92ae;
+                }
+                QCheckBox::indicator:checked {
+                    background: #2f94ae;
+                    border-color: #68cbde;
+                }
+                QScrollArea#SearchScroll {
+                    border: 1px solid #2a3f54;
+                    border-radius: 10px;
+                    background: #0f1a26;
+                }
+                QWidget#SearchViewport, QWidget#SearchResultsHost {
+                    background: #0f1a26;
+                }
+                QTextEdit#LogText {
+                    background: #0b141e;
+                    border: 1px solid #334b62;
+                    border-radius: 10px;
+                    color: #d8edf8;
+                    padding: 8px;
+                }
+                QWidget#LogViewport {
+                    background: #0b141e;
+                    color: #d8edf8;
+                }
+                QHeaderView::section {
+                    background: #152435;
+                    color: #d7eaf6;
+                    border: none;
+                    border-bottom: 1px solid #2f455a;
+                    padding: 6px 8px;
+                    font-weight: 600;
+                }
+                QTableWidget {
+                    alternate-background-color: #0f1b28;
+                }
+
+                QProgressBar {
+                    background: #0b141e;
+                    border: 1px solid #334b62;
+                    border-radius: 7px;
+                    text-align: center;
+                    color: #d8edf8;
+                }
+                QProgressBar::chunk {
+                    border-radius: 6px;
+                    background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #17a3bf, stop:1 #39d0e6);
+                }
+
+                QPushButton, QToolButton {
+                    background: #203447;
+                    border: 1px solid #38556d;
+                    border-radius: 7px;
+                    padding: 6px 11px;
+                    color: #dcedf7;
+                    font-weight: 600;
+                }
+                QPushButton#ResultActionButton {
+                    padding: 4px 9px;
+                    border-radius: 6px;
+                }
+                QPushButton:hover, QToolButton:hover { background: #29445b; border-color: #4e7494; }
+                QPushButton:pressed, QToolButton:pressed { background: #1a2c3a; }
+                QPushButton:disabled { color: #8298aa; background: #16222f; border-color: #253443; }
+
+                QTabWidget::pane {
+                    border: 1px solid #2b4258;
+                    border-radius: 10px;
+                    top: -2px;
+                    background: #0f1a26;
+                }
+                QTabBar::tab {
+                    background: #162737;
+                    border: 1px solid #2e4459;
+                    border-bottom: none;
+                    padding: 8px 14px;
+                    border-top-left-radius: 8px;
+                    border-top-right-radius: 8px;
+                    margin-right: 4px;
+                    color: #b9d3e7;
+                }
+                QTabBar::tab:selected {
+                    background: #20506d;
+                    color: #f3fbff;
+                    border-color: #3f6b89;
+                }
+                """
             )
-        ],
-        expand=True,
-    )
-    
-    # --- Folder Picker ---
-    def on_folder_result(e: ft.FilePickerResultEvent):
-        if e.path:
-            nonlocal download_dir
-            download_dir = e.path
-            folder_text_ref.value = download_dir
-            folder_text_ref.update()
-            sa_config.save_config("download_dir", download_dir)
-            print(f"[Settings] Download folder changed to: {download_dir}")
+        else:
+            self.setStyleSheet(
+                """
+                QMainWindow { background: #f3f8fd; color: #1a2b39; }
+                QWidget#AppRoot { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #eef5fb, stop:0.55 #f6fbff, stop:1 #eaf3fb); }
+                QLabel { color: #1f3448; background: transparent; }
+                QFrame#HeaderFrame {
+                    background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #197b96, stop:0.55 #2f9fb7, stop:1 #3ba7bd);
+                    border: 1px solid #69bfd0;
+                    border-radius: 16px;
+                }
+                QLabel#HeaderTitle { color: #ffffff; font-size: 30px; font-weight: 800; letter-spacing: 0.25px; }
+                QLabel#HeaderSubtitle { color: #eaffff; font-size: 13px; }
+                QLabel#AuthLabel { color: #106930; font-weight: 700; }
+                QLabel#PanelLabel { color: #1d3b50; font-size: 22px; font-weight: 700; }
 
-    folder_picker = ft.FilePicker(on_result=on_folder_result)
-    page.overlay.append(folder_picker)
-    
-    folder_text_ref = ft.TextField(value=download_dir, read_only=True, text_size=12, border_color="grey")
+                QFrame#FolderBar, QFrame#TabsShell, QFrame#LogShell {
+                    border: 1px solid #cad8e4;
+                    border-radius: 12px;
+                    background: #ffffff;
+                }
 
-    # Settings Dialog
-    def open_settings(e):
-        def close_dlg(e):
-            page.close(dlg)
+                QLabel#SearchStatus, QLabel#MutedText { color: #5a748d; }
+                QFrame#ResultCard {
+                    border: 1px solid #d2e0ec;
+                    border-radius: 12px;
+                    background: #f9fcff;
+                }
+                QLabel#ResultTitle { color: #1f3c50; font-size: 12px; font-weight: 700; }
+                QLabel#ResultMeta { color: #56738a; font-size: 10px; }
+                QFrame#CollapsibleSection {
+                    border: 1px solid #d2e0ec;
+                    border-radius: 8px;
+                    background: #f7fbff;
+                    padding: 2px;
+                }
+                QToolButton#CollapseToggle {
+                    text-align: left;
+                    border: 1px solid #c7d7e4;
+                    border-radius: 8px;
+                    background: #e8f0f7;
+                    color: #445d71;
+                    font-weight: 600;
+                    padding: 5px 10px;
+                }
+                QToolButton#CollapseToggle:hover {
+                    background: #dceaf5;
+                    border-color: #9fb7c8;
+                }
+                QToolButton#CollapseToggle:checked {
+                    background: #ffffff;
+                    color: #12344a;
+                    border-color: #a8c2d4;
+                }
 
-        folder_text_ref.value = download_dir
+                QLineEdit, QComboBox, QTableWidget {
+                    background: #ffffff;
+                    border: 1px solid #c7d7e4;
+                    border-radius: 7px;
+                    padding: 5px;
+                    color: #22394d;
+                    selection-background-color: #6ebbd0;
+                }
+                QLineEdit::placeholder {
+                    color: #8399ac;
+                }
+                QComboBox QAbstractItemView {
+                    background: #ffffff;
+                    color: #22394d;
+                    border: 1px solid #c7d7e4;
+                    selection-background-color: #6ebbd0;
+                    selection-color: #12384e;
+                }
+                QCheckBox {
+                    color: #27465b;
+                    spacing: 8px;
+                    padding-right: 2px;
+                }
+                QCheckBox::indicator {
+                    width: 16px;
+                    height: 16px;
+                    border: 1px solid #9fb8ca;
+                    border-radius: 4px;
+                    background: #ffffff;
+                }
+                QCheckBox::indicator:hover {
+                    border-color: #7ea0b8;
+                }
+                QCheckBox::indicator:checked {
+                    background: #52b9cf;
+                    border-color: #2d92aa;
+                }
+                QScrollArea#SearchScroll {
+                    border: 1px solid #cfdeea;
+                    border-radius: 10px;
+                    background: #ffffff;
+                }
+                QWidget#SearchViewport, QWidget#SearchResultsHost {
+                    background: #ffffff;
+                }
+                QTextEdit#LogText {
+                    background: #ffffff;
+                    border: 1px solid #ccd9e3;
+                    border-radius: 10px;
+                    color: #244257;
+                    padding: 8px;
+                }
+                QWidget#LogViewport {
+                    background: #ffffff;
+                    color: #244257;
+                }
+                QHeaderView::section {
+                    background: #e9f1f8;
+                    color: #203748;
+                    border: none;
+                    border-bottom: 1px solid #c8d9e5;
+                    padding: 6px 8px;
+                    font-weight: 600;
+                }
+                QTableWidget {
+                    alternate-background-color: #f5faff;
+                }
 
-        def refresh_api_key(e):
-            try:
-                sa_auth.get_api_key(force_refresh=True)
-                check_auth() # Update UI status
-                page.snack_bar = ft.SnackBar(ft.Text("API Key Refreshed!"))
-                page.snack_bar.open = True
-                page.update()
-            except Exception as err:
-                page.snack_bar = ft.SnackBar(ft.Text(f"Error refreshing key: {err}"), bgcolor="red")
-                page.snack_bar.open = True
-                page.update()
+                QProgressBar {
+                    background: #edf4fb;
+                    border: 1px solid #c7d8e6;
+                    border-radius: 7px;
+                    text-align: center;
+                    color: #244257;
+                }
+                QProgressBar::chunk {
+                    border-radius: 6px;
+                    background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #2da5be, stop:1 #58cbe0);
+                }
 
-        dlg = ft.AlertDialog(
-            title=ft.Text("Settings"),
-            content=ft.Container(
-                width=550,
-                height=350,
-                content=ft.Row([
-                    # Left Side: Settings
-                    ft.Container(
-                        expand=1,
-                        padding=10,
-                        content=ft.Column([
-                            ft.Text("Preferences", weight="bold"),
-                            ft.Divider(),
-                            ft.Row([
-                                ft.Text("Show Logs:"),
-                                ft.Switch(value=logs_visible, on_change=lambda e: toggle_logs(e))
-                            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-                            ft.Container(height=20),
-                            ft.Text("Default Download Folder:", size=12),
-                            folder_text_ref,
-                            ft.ElevatedButton("Change Folder", on_click=lambda _: folder_picker.get_directory_path()),
-                            ft.Container(height=20),
-                            ft.Text("API Key:", size=12),
-                            ft.ElevatedButton("Refresh Key", on_click=refresh_api_key)
-                        ])
-                    ),
-                    ft.VerticalDivider(),
-                    # Right Side: Info
-                    ft.Container(
-                        expand=1,
-                        padding=10,
-                        content=ft.Column([
-                            ft.Text("About", weight="bold"),
-                            ft.Divider(),
-                            ft.Text("SermonAudio Downloader", size=16),
-                            ft.Text("Concept & Implementation by Vincent L.", size=12, italic=True),
-                            ft.Text("2025", size=12),
-                            ft.Container(height=20),
-                            ft.Text("A powerful tool to archive sermons, series, and speaker libraries.", size=12),
-                            ft.Container(height=20),
-                            ft.Text("v1.0.0", color="grey", size=10)
-                        ], alignment=ft.MainAxisAlignment.START)
+                QPushButton, QToolButton {
+                    background: #e7f0f8;
+                    border: 1px solid #bfd1de;
+                    border-radius: 7px;
+                    padding: 6px 11px;
+                    color: #1f3547;
+                    font-weight: 600;
+                }
+                QPushButton#ResultActionButton {
+                    padding: 4px 9px;
+                    border-radius: 6px;
+                }
+                QPushButton:hover, QToolButton:hover { background: #dceaf5; border-color: #9fb7c8; }
+                QPushButton:pressed, QToolButton:pressed { background: #d0e2ef; }
+                QPushButton:disabled { color: #7f95a7; background: #ecf3f9; border-color: #d3e0ea; }
+
+                QTabWidget::pane {
+                    border: 1px solid #d0dee9;
+                    border-radius: 10px;
+                    top: -2px;
+                    background: #ffffff;
+                }
+                QTabBar::tab {
+                    background: #e8f0f7;
+                    border: 1px solid #c7d7e4;
+                    border-bottom: none;
+                    padding: 8px 14px;
+                    border-top-left-radius: 8px;
+                    border-top-right-radius: 8px;
+                    margin-right: 4px;
+                    color: #445d71;
+                }
+                QTabBar::tab:selected {
+                    background: #ffffff;
+                    color: #12344a;
+                    border-color: #a8c2d4;
+                }
+                """
+            )
+
+    def _append_log_text(self, text: str):
+        if not text:
+            return
+        self.log_text.moveCursor(QTextCursor.MoveOperation.End)
+        self.log_text.insertPlainText(text)
+        self.log_text.moveCursor(QTextCursor.MoveOperation.End)
+        plain = self.log_text.toPlainText()
+        if len(plain) > 120000:
+            self.log_text.setPlainText(plain[-90000:])
+            self.log_text.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _toggle_logs_visibility(self):
+        self._update_log_visibility(not self.log_text.isVisible(), save=True)
+
+    def _update_log_visibility(self, visible: bool, save: bool):
+        self.log_text.setVisible(visible)
+        self.toggle_logs_btn.setText("Hide Logs" if visible else "Show Logs")
+        self.show_logs = visible
+        if save:
+            sa_config.save_config("show_logs", visible)
+
+    def _show_message(self, title: str, message: str):
+        QMessageBox.information(self, title, message)
+
+    def _show_error(self, title: str, message: str):
+        QMessageBox.critical(self, title, message)
+
+    def _set_download_dir(self, folder: str):
+        self.download_dir = folder
+        self.download_dir_label.setText(folder)
+        sa_config.save_config("download_dir", folder)
+        self._show_message("Download Folder", "Download folder updated.")
+
+    def _choose_download_dir(self):
+        chosen = QFileDialog.getExistingDirectory(self, "Choose download folder", self.download_dir)
+        if chosen:
+            self._set_download_dir(chosen)
+
+    def _open_path(self, path: str):
+        if not path:
+            return
+        try:
+            if os.path.exists(path):
+                if sys.platform == "win32":
+                    os.startfile(path)  # type: ignore[attr-defined]
+                elif sys.platform == "darwin":
+                    subprocess.call(("open", path))
+                else:
+                    subprocess.call(("xdg-open", path))
+                return
+            QDesktopServices.openUrl(path)
+        except Exception as exc:
+            print(f"[GUI] Failed to open path/url: {exc}")
+            self._show_error("Open Error", str(exc))
+
+    def _refresh_auth_status(self, force: bool):
+        def _job(signals: WorkerSignals):
+            key = sa_auth.get_api_key(force_refresh=force)
+            return key
+
+        worker = Worker(_job)
+        worker.signals.finished.connect(self._on_auth_success)
+        worker.signals.error.connect(self._on_auth_error)
+        self.thread_pool.start(worker)
+
+    def _on_auth_success(self, key: str):
+        short = _safe_text(key)[-6:]
+        self.auth_label.setText(f"API key active (...{short})")
+
+    def _on_auth_error(self, err: str):
+        self.auth_label.setText("Auth error")
+        print(err)
+
+    def _run_search(self):
+        query = _safe_text(self.search_input.text())
+        if not query:
+            self._show_message("Search", "Enter a search query first.")
+            return
+
+        newest = self.search_newest_check.isChecked()
+        self.search_btn.setEnabled(False)
+        self.search_status.setText("Searching...")
+
+        def _job(signals: WorkerSignals):
+            sort_by = "newest-published" if newest else None
+            data = sa_search.perform_search(query, sort_by=sort_by)
+            return data
+
+        worker = Worker(_job)
+        worker.signals.finished.connect(self._render_search_results)
+        worker.signals.error.connect(self._on_search_error)
+        worker.signals.done.connect(lambda: self.search_btn.setEnabled(True))
+        self.thread_pool.start(worker)
+
+    def _clear_search_results(self):
+        for section in (
+            self.speakers_section,
+            self.broadcasters_section,
+            self.sermons_section,
+            self.series_section,
+        ):
+            section.clear_content()
+
+    def _add_empty_result_label(self, section: CollapsibleSection, text: str):
+        label = QLabel(text)
+        label.setObjectName("MutedText")
+        label.setWordWrap(True)
+        section.body_layout.addWidget(label)
+
+    def _render_search_results(self, data: dict):
+        self._clear_search_results()
+        total = 0
+
+        speakers = (data.get("speakerResults") or [])[:10]
+        if speakers:
+            total += len(speakers)
+            for item in speakers:
+                sid = _safe_text(item.get("speakerID"))
+                name = _safe_text(item.get("displayName"), "Unknown speaker")
+                count = item.get("sermonCount")
+                count_text = f"{count} sermons" if count is not None else "Unknown sermon count"
+                self.speakers_section.body_layout.addWidget(
+                    self._make_result_card(
+                        title=name,
+                        subtitle=f"Speaker ID: {sid} | {count_text}",
+                        queue_cb=lambda _=False, target=sid, n=name: self._queue_bulk_download("speaker", target, n),
+                        open_cb=None,
+                        queue_label="Queue All",
                     )
-                ])
-            ),
-            actions=[
-                ft.TextButton("Close", on_click=close_dlg),
-            ],
+                )
+        else:
+            self._add_empty_result_label(self.speakers_section, "No speaker results.")
+
+        broadcasters = (data.get("broadcasterResults") or [])[:8]
+        if broadcasters:
+            total += len(broadcasters)
+            for item in broadcasters:
+                bid = _safe_text(item.get("broadcasterID"))
+                name = _safe_text(item.get("displayName"), "Unknown broadcaster")
+                location = _safe_text(item.get("location"), "Unknown location")
+                self.broadcasters_section.body_layout.addWidget(
+                    self._make_result_card(
+                        title=name,
+                        subtitle=f"{location} | Broadcaster ID: {bid}",
+                        queue_cb=lambda _=False, target=bid, n=name: self._queue_bulk_download("broadcaster", target, n),
+                        open_cb=lambda _=False, b=bid: webbrowser.open(f"https://www.sermonaudio.com/broadcasters/{b}"),
+                        queue_label="Queue All",
+                    )
+                )
+        else:
+            self._add_empty_result_label(self.broadcasters_section, "No broadcaster results.")
+
+        sermons = (data.get("sermonResults") or [])[:12]
+        if sermons:
+            total += len(sermons)
+            for item in sermons:
+                sid = str(item.get("sermonID", ""))
+                title = _sermon_title(item)
+                speaker = _speaker_name(item)
+                broadcaster = _broadcaster_name(item)
+                date = _safe_text(item.get("preachDate"), "Unknown date")
+                url = f"https://www.sermonaudio.com/sermons/{sid}"
+                self.sermons_section.body_layout.addWidget(
+                    self._make_result_card(
+                        title=title,
+                        subtitle=f"{speaker} | {broadcaster} | {date} | ID: {sid}",
+                        queue_cb=lambda _=False, target=sid, t=title: self._queue_single_download(target, title=t),
+                        open_cb=lambda _=False, u=url: webbrowser.open(u),
+                        queue_label="Queue",
+                    )
+                )
+        else:
+            self._add_empty_result_label(self.sermons_section, "No sermon results.")
+
+        series_items = (data.get("seriesResults") or [])[:10]
+        if series_items:
+            total += len(series_items)
+            for item in series_items:
+                series_id = _safe_text(item.get("seriesID"))
+                title = _safe_text(item.get("title"), "Untitled series")
+                broadcaster = _safe_text(item.get("broadcaster", {}).get("displayName"), "Unknown broadcaster")
+                sermon_count = item.get("count")
+                sermon_count_text = f"{sermon_count} sermons" if sermon_count is not None else "Unknown count"
+                latest = _safe_text(item.get("latest"), "Unknown latest date")
+                url = f"https://www.sermonaudio.com/series/{series_id}"
+                self.series_section.body_layout.addWidget(
+                    self._make_result_card(
+                        title=title,
+                        subtitle=f"{broadcaster} | {sermon_count_text} | Latest: {latest} | ID: {series_id}",
+                        queue_cb=lambda _=False, target=series_id, n=title: self._queue_bulk_download("series", target, n),
+                        open_cb=lambda _=False, u=url: webbrowser.open(u),
+                        queue_label="Queue All",
+                    )
+                )
+        else:
+            self._add_empty_result_label(self.series_section, "No series results.")
+
+        if total == 0:
+            self.search_status.setText("No results.")
+        else:
+            self.search_status.setText(f"Loaded {total} result items.")
+
+    def _on_search_error(self, err: str):
+        self.search_status.setText("Search failed.")
+        print(err)
+        self._show_error("Search Error", "Search failed. Check logs for details.")
+
+    def _make_result_card(
+        self,
+        title: str,
+        subtitle: str,
+        queue_cb: Optional[Callable],
+        open_cb: Optional[Callable],
+        queue_label: Optional[str],
+    ) -> QWidget:
+        frame = QFrame()
+        frame.setObjectName("ResultCard")
+        frame.setFrameShape(QFrame.Shape.StyledPanel)
+
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
+
+        title_lbl = QLabel(title)
+        title_lbl.setObjectName("ResultTitle")
+        title_font = QFont()
+        title_font.setPointSize(9)
+        title_font.setBold(True)
+        title_lbl.setFont(title_font)
+        title_lbl.setWordWrap(True)
+
+        sub_lbl = QLabel(subtitle)
+        sub_lbl.setWordWrap(True)
+        sub_lbl.setObjectName("ResultMeta")
+        sub_font = QFont()
+        sub_font.setPointSize(8)
+        sub_lbl.setFont(sub_font)
+
+        btn_row = QHBoxLayout()
+        if queue_cb and queue_label:
+            queue_btn = QPushButton(queue_label)
+            queue_btn.setObjectName("ResultActionButton")
+            queue_btn.clicked.connect(queue_cb)
+            btn_row.addWidget(queue_btn)
+
+        if open_cb:
+            open_btn = QPushButton("Open")
+            open_btn.setObjectName("ResultActionButton")
+            open_btn.clicked.connect(open_cb)
+            btn_row.addWidget(open_btn)
+
+        btn_row.addStretch(1)
+
+        layout.addWidget(title_lbl)
+        layout.addWidget(sub_lbl)
+        layout.addLayout(btn_row)
+        return frame
+
+    def _on_manual_format_changed(self, value: str):
+        value = value.lower()
+        current = self.manual_quality_combo.currentText().lower()
+        self.manual_quality_combo.clear()
+        if value == "audio":
+            self.manual_quality_combo.addItems(["Low", "High"])
+        else:
+            self.manual_quality_combo.addItems(["Low", "High", "1080p"])
+
+        idx = self.manual_quality_combo.findText(current.capitalize(), Qt.MatchFlag.MatchFixedString)
+        self.manual_quality_combo.setCurrentIndex(0 if idx < 0 else idx)
+
+    def _queue_manual_download(self):
+        target = _safe_text(self.manual_target_input.text())
+        if not target:
+            self._show_message("Manual Download", "Enter a sermon URL or ID first.")
+            return
+        self._queue_single_download(target=target, title=target)
+
+    def _new_task_id(self) -> int:
+        task_id = self.next_task_id
+        self.next_task_id += 1
+        return task_id
+
+    def _add_queue_task_row(self, item_name: str, item_type: str, status: str = "Pending") -> int:
+        task_id = self._new_task_id()
+        row = self.queue_table.rowCount()
+        self.queue_table.insertRow(row)
+
+        name_item = QTableWidgetItem(item_name)
+        type_item = QTableWidgetItem(item_type)
+        status_item = QTableWidgetItem(status)
+
+        progress = QProgressBar()
+        progress.setRange(0, 100)
+        progress.setValue(0)
+
+        action_btn = QPushButton("Open")
+        action_btn.setEnabled(False)
+        action_btn.clicked.connect(lambda _=False, tid=task_id: self._open_task_output(tid))
+
+        self.queue_table.setItem(row, 0, name_item)
+        self.queue_table.setItem(row, 1, type_item)
+        self.queue_table.setItem(row, 2, status_item)
+        self.queue_table.setCellWidget(row, 3, progress)
+        self.queue_table.setCellWidget(row, 4, action_btn)
+
+        self.queue_tasks[task_id] = QueueTaskUI(
+            task_id=task_id,
+            name_item=name_item,
+            type_item=type_item,
+            status_item=status_item,
+            progress_bar=progress,
+            action_btn=action_btn,
         )
-        page.open(dlg)
+        self._refresh_queue_counts()
+        return task_id
 
-    settings_btn = ft.IconButton(ft.Icons.SETTINGS, on_click=open_settings)
+    def _refresh_queue_counts(self):
+        self.queued_count_label.setText(f"{len(self.queue_tasks)} queued")
+        self.active_count_label.setText(f"{self.active_tasks} active")
 
-    page.add(
-        ft.Row([header, ft.Container(expand=True), auth_status, settings_btn], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-        ft.Divider(),
-        ft.Container(content=tabs, expand=True),
-        ft.Row([ft.Text("Logs:", weight="bold"), ft.Container(expand=True), btn_toggle_logs]),
-        log_card
-    )
+    def _change_active_tasks(self, delta: int):
+        self.active_tasks = max(0, self.active_tasks + delta)
+        self._refresh_queue_counts()
 
-    check_auth()
+    def _set_task_status(self, task_id: int, text: str):
+        task = self.queue_tasks.get(task_id)
+        if not task:
+            return
+        task.status_item.setText(text)
+
+    def _set_task_progress(self, task_id: int, current: int, total: int):
+        task = self.queue_tasks.get(task_id)
+        if not task:
+            return
+        if total <= 0:
+            task.progress_bar.setRange(0, 0)
+            return
+
+        task.progress_bar.setRange(0, 100)
+        pct = int((max(0, current) / max(1, total)) * 100)
+        task.progress_bar.setValue(min(100, pct))
+
+    def _mark_task_error(self, task_id: int, err: str):
+        task = self.queue_tasks.get(task_id)
+        if not task:
+            return
+        task.done = True
+        task.status_item.setText("Error")
+        task.status_item.setForeground(QColor("#d9534f"))
+        task.progress_bar.setRange(0, 100)
+        print(err)
+
+    def _mark_task_finished(self, task_id: int, result: Any):
+        task = self.queue_tasks.get(task_id)
+        if not task:
+            return
+        task.done = True
+        task.progress_bar.setRange(0, 100)
+        task.progress_bar.setValue(100)
+
+        status = "Complete"
+        open_path = None
+        if isinstance(result, dict):
+            status = _safe_text(result.get("status"), "Complete")
+            open_path = result.get("open_path")
+        elif isinstance(result, str):
+            open_path = result
+
+        task.status_item.setText(status)
+        task.status_item.setForeground(QColor("#41a65a"))
+        if open_path and os.path.exists(open_path):
+            task.open_path = open_path
+            task.action_btn.setEnabled(True)
+
+    def _open_task_output(self, task_id: int):
+        task = self.queue_tasks.get(task_id)
+        if not task or not task.open_path:
+            return
+        self._open_path(task.open_path)
+
+    def _remove_task_row(self, task_id: int):
+        task = self.queue_tasks.get(task_id)
+        if not task:
+            return
+        row = self.queue_table.row(task.name_item)
+        if row >= 0:
+            self.queue_table.removeRow(row)
+        self.queue_tasks.pop(task_id, None)
+        self._refresh_queue_counts()
+
+    def _clear_completed_tasks(self):
+        to_remove = [tid for tid, task in self.queue_tasks.items() if task.done]
+        for tid in to_remove:
+            self._remove_task_row(tid)
+
+    def _clear_all_tasks(self):
+        if self.active_tasks > 0:
+            self._show_message("Queue", "Active tasks are still running. Wait for completion first.")
+            return
+        for tid in list(self.queue_tasks.keys()):
+            self._remove_task_row(tid)
+    def _queue_single_download(
+        self,
+        target: str,
+        title: Optional[str] = None,
+        media_format: Optional[str] = None,
+        quality: Optional[str] = None,
+    ):
+        item_title = title or target
+        fmt = (media_format or self.manual_format_combo.currentText()).strip().lower()
+        qual = (quality or self.manual_quality_combo.currentText()).strip().lower()
+        if fmt not in ("audio", "video"):
+            fmt = "audio"
+        if qual not in ("low", "high", "1080p"):
+            qual = "low"
+
+        task_id = self._add_queue_task_row(item_name=item_title, item_type=f"Single ({fmt})", status="Queued")
+        self.tabs.setCurrentIndex(2)
+
+        def _job(signals: WorkerSignals):
+            signals.status.emit("Preparing")
+            sid = sa_dl.extract_sermon_id(target)
+
+            if fmt == "video" and sid:
+                signals.status.emit("Checking video")
+                info = sa_search.get_sermon_info(sid)
+                has_video = bool(info.get("hasVideo"))
+                has_video_media = bool(info.get("media", {}).get("video"))
+                if not has_video or not has_video_media:
+                    raise RuntimeError("This sermon has no video available.")
+
+            def _progress(current, total):
+                signals.progress.emit(int(current), int(total))
+                if total:
+                    pct = int((current / total) * 100)
+                    signals.status.emit(f"{pct}%")
+                else:
+                    signals.status.emit("Downloading")
+
+            if fmt == "video":
+                if sa_dl.is_media_url(target, ".mp4"):
+                    q = sa_dl.detect_quality_from_url(target, "video") or qual
+                    output = sa_dl.download_file(
+                        target,
+                        self.download_dir,
+                        media_type="video",
+                        quality=q,
+                        progress_callback=_progress,
+                    )
+                else:
+                    sid_value = sid or target
+                    url = sa_dl.build_video_url(sid_value, qual)
+                    output = sa_dl.download_file(
+                        url,
+                        self.download_dir,
+                        media_type="video",
+                        quality=qual,
+                        progress_callback=_progress,
+                    )
+            else:
+                if sa_dl.is_media_url(target, ".mp3"):
+                    q = sa_dl.detect_quality_from_url(target, "audio") or qual
+                    output = sa_dl.download_file(
+                        target,
+                        self.download_dir,
+                        media_type="audio",
+                        quality=q,
+                        progress_callback=_progress,
+                    )
+                elif sid:
+                    output = sa_dl.download_audio_with_fallback(
+                        sid,
+                        self.download_dir,
+                        preferred_quality=qual,
+                        progress_callback=_progress,
+                    )
+                else:
+                    output = sa_dl.download_file(
+                        target,
+                        self.download_dir,
+                        media_type="audio",
+                        quality=qual,
+                        progress_callback=_progress,
+                    )
+
+            return {"status": "Complete", "open_path": str(output)}
+
+        self._start_queue_worker(task_id, _job)
+
+    def _queue_bulk_download(self, mode: str, target_id: str, name_hint: str):
+        mode = mode.lower().strip()
+        if mode not in ("speaker", "broadcaster", "series"):
+            self._show_error("Queue Error", f"Unknown bulk mode: {mode}")
+            return
+
+        task_id = self._add_queue_task_row(item_name=name_hint, item_type=f"Bulk ({mode})", status="Queued")
+        self.tabs.setCurrentIndex(2)
+
+        def _job(signals: WorkerSignals):
+            signals.status.emit("Fetching list")
+            signals.progress.emit(0, 0)
+
+            if mode == "speaker":
+                display_name = sa_speaker.get_speaker_name(target_id)
+                sermon_ids = sa_speaker.collect_sermon_ids_via_node(target_id)
+                download_fn = sa_speaker.download_sermon_audio
+                folder_path = os.path.join(self.download_dir, sa_dl.sanitize_filename(display_name))
+            elif mode == "broadcaster":
+                display_name = sa_broadcaster.get_broadcaster_name(target_id)
+                sermon_ids = sa_broadcaster.collect_sermon_ids_via_broadcaster(target_id)
+                download_fn = sa_broadcaster.download_sermon_audio
+                folder_path = os.path.join(self.download_dir, sa_dl.sanitize_filename(display_name))
+            else:
+                series_id = sa_series.extract_series_id(target_id) or _safe_text(target_id)
+                if not series_id:
+                    raise RuntimeError("Invalid series ID.")
+
+                html = sa_series.fetch_series_html(series_id)
+                display_name = sa_series.extract_series_title_from_html(html) or f"Series {series_id}"
+                feed_xml = sa_series.fetch_series_feed(series_id)
+                if feed_xml:
+                    sermon_ids = sa_series.extract_sermon_ids_from_feed(feed_xml)
+                else:
+                    sermon_ids = []
+                if not sermon_ids:
+                    sermon_ids = sa_series.extract_sermon_ids_from_series_html(html)
+
+                folder_path = os.path.join(self.download_dir, sa_dl.sanitize_filename(display_name))
+                os.makedirs(folder_path, exist_ok=True)
+
+                def download_fn(sermon_id: str, out_dir: str, _display_name: str):
+                    sa_dl.download_audio_with_fallback(sermon_id, out_dir)
+
+            if not sermon_ids:
+                raise RuntimeError("No sermons found for this target.")
+
+            total = len(sermon_ids)
+            failures = 0
+            target_dir = folder_path if mode == "series" else self.download_dir
+            for idx, sermon_id in enumerate(sermon_ids, start=1):
+                signals.status.emit(f"{idx}/{total}")
+                signals.progress.emit(idx, total)
+                try:
+                    download_fn(sermon_id, target_dir, display_name)
+                except Exception as exc:
+                    failures += 1
+                    print(f"[bulk] Failed sermon {sermon_id}: {exc}")
+
+            status = "Complete" if failures == 0 else f"Complete ({failures} failed)"
+            return {"status": status, "open_path": folder_path}
+
+        self._start_queue_worker(task_id, _job)
+
+    def _start_queue_worker(self, task_id: int, job_fn: Callable[[WorkerSignals], Any]):
+        worker = Worker(job_fn)
+        worker.signals.started.connect(lambda tid=task_id: self._change_active_tasks(1))
+        worker.signals.status.connect(lambda text, tid=task_id: self._set_task_status(tid, text))
+        worker.signals.progress.connect(lambda cur, tot, tid=task_id: self._set_task_progress(tid, cur, tot))
+        worker.signals.error.connect(lambda err, tid=task_id: self._mark_task_error(tid, err))
+        worker.signals.finished.connect(lambda result, tid=task_id: self._mark_task_finished(tid, result))
+        worker.signals.done.connect(lambda tid=task_id: self._change_active_tasks(-1))
+        self.thread_pool.start(worker)
+
+    def _open_settings_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Settings")
+        dialog.resize(620, 280)
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(10)
+
+        dark_check = QCheckBox("Dark mode")
+        dark_check.setChecked(self.dark_mode)
+        dark_check.toggled.connect(self._set_dark_mode)
+
+        logs_check = QCheckBox("Show logs")
+        logs_check.setChecked(self.show_logs)
+        logs_check.toggled.connect(lambda v: self._update_log_visibility(v, save=True))
+
+        layout.addWidget(dark_check)
+        layout.addWidget(logs_check)
+
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(QLabel("Download folder:"))
+        folder_edit = QLineEdit(self.download_dir)
+        folder_edit.setReadOnly(True)
+        folder_row.addWidget(folder_edit, 1)
+        folder_choose_btn = QPushButton("Change Folder")
+
+        def _choose_folder_dialog():
+            chosen = QFileDialog.getExistingDirectory(dialog, "Choose download folder", self.download_dir)
+            if chosen:
+                self._set_download_dir(chosen)
+                folder_edit.setText(chosen)
+
+        folder_choose_btn.clicked.connect(_choose_folder_dialog)
+        folder_row.addWidget(folder_choose_btn)
+        layout.addLayout(folder_row)
+
+        auth_btn = QPushButton("Refresh API Key")
+        auth_btn.clicked.connect(lambda: self._refresh_auth_status(force=True))
+        layout.addWidget(auth_btn)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+
+        dialog.exec()
+
+    def _set_dark_mode(self, enabled: bool):
+        self.dark_mode = bool(enabled)
+        self._apply_theme(self.dark_mode)
+        sa_config.save_config("theme_mode", "dark" if self.dark_mode else "light")
+
+    def closeEvent(self, event):
+        sys.stdout = self._orig_stdout
+        sys.stderr = self._orig_stderr
+        super().closeEvent(event)
+
+
+def run():
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    window = SermonAudioMainWindow()
+    window.show()
+    sys.exit(app.exec())
+
 
 if __name__ == "__main__":
-    ft.app(target=main)
+    run()

@@ -5,7 +5,7 @@ A concept set of open tools to download sermons, series, and entire speaker libr
 ## Features
 
 - **CLI:** Search and download from the command line.
-- **GUI:** A fast, native desktop interface built with Flet.
+- **GUI:** A native desktop interface built with Qt (PySide6).
 - **Auto-Auth:** Automatically fetches and maintains the required API keys.
 - **Bulk Downloading:** Download entire speaker libraries, broadcaster catalogs, or sermon series.
 - **Smart Tagging:** Automatically renames files based on metadata (where available).
@@ -15,7 +15,7 @@ A concept set of open tools to download sermons, series, and entire speaker libr
 1.  Clone the repo.
 2.  Install dependencies:
     ```bash
-    pip install requests beautifulsoup4 flet mutagen
+    pip install requests beautifulsoup4 PySide6 mutagen
     ```
 
 ## Usage
